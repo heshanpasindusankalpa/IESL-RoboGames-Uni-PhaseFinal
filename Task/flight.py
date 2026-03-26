@@ -26,7 +26,7 @@ sys.path.insert(0, ".")
 # MISSION CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-TARGET_COUNTRIES = [1, 2]   # ← set these to the required country codes
+Airports = [1, 2]   # ← set these to the required country codes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -452,7 +452,7 @@ def run():
     current_tag: TagResult | None = None
     tag_hover_start = pre_land_start = tag_reacquire_start = 0.0
     pre_land_lock_count = 0
-    targets_remaining = list(TARGET_COUNTRIES)
+    targets_remaining = list(Airports)
     visited_tags = set()
     last_tag_detections = []
     tag_mask_memory = []
@@ -472,7 +472,7 @@ def run():
     blank = np.zeros((200, 320, 3), dtype=np.uint8)
 
     print("\n[Test] Ready.")
-    print(f"  Target countries: {TARGET_COUNTRIES}")
+    print(f"  Target countries: {Airports}")
     print("  F=follow  C=creep  T=thresh  0=stop  Q=land\n")
 
     while True:
