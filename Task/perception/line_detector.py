@@ -150,9 +150,19 @@ class LineDetector:
             # Not enough slices fired — no confident detection
             confidence = len(valid_points) / self.cfg.num_slices
             if len(valid_points) == 1:
+                # If only one slice fired (often means horizontal line!),
+                # compute angle strictly pointing towards that centroid from the bottom-center of ROI
+                dx = valid_points[0][0] - (w / 2)
+                dy = valid_points[0][1] - h  # negative since y_mid < h
+
+                # To match np.polyfit, we use dx/dy.
+                # If the line is to the right (dx > 0), dx/dy < 0, angle should be NEGATIVE.
+                angle_deg = float(np.degrees(
+                    np.arctan(dx / dy))) if dy != 0 else 0.0
+
                 return LineResult(
                     centroid_x=valid_points[0][0],
-                    angle_deg=0.0,
+                    angle_deg=angle_deg,
                     confidence=confidence,
                     slice_points=valid_points,
                 )

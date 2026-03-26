@@ -35,7 +35,7 @@ else:
 os.environ["PYTHONIOENCODING"] = "UTF-8"
 sys.path.append(f"{WEBOTS_HOME}/lib/controller/python")
 
-from controller import Robot, Camera, RangeFinder # noqa: E401, E402
+from controller import Robot, Camera, RangeFinder  # noqa: E401, E402
 
 
 class WebotsArduVehicle():
@@ -118,7 +118,7 @@ class WebotsArduVehicle():
         # init camera
         if camera_name is not None:
             self.camera = self.robot.getDevice(camera_name)
-            self.camera.enable(1000//camera_fps) # takes frame period in ms
+            self.camera.enable(1000//camera_fps)  # takes frame period in ms
 
             # start camera streaming thread if requested
             if camera_stream_port is not None:
@@ -130,7 +130,8 @@ class WebotsArduVehicle():
         # init rangefinder
         if rangefinder_name is not None:
             self.rangefinder = self.robot.getDevice(rangefinder_name)
-            self.rangefinder.enable(1000//rangefinder_fps) # takes frame period in ms
+            # takes frame period in ms
+            self.rangefinder.enable(1000//rangefinder_fps)
 
             # start rangefinder streaming thread if requested
             if rangefinder_stream_port is not None:
@@ -146,7 +147,8 @@ class WebotsArduVehicle():
             m.setVelocity(0)
 
         # start ArduPilot SITL communication thread
-        self._sitl_thread = Thread(daemon=True, target=self._handle_sitl, args=[sitl_address, 9002+10*instance])
+        self._sitl_thread = Thread(daemon=True, target=self._handle_sitl, args=[
+                                   sitl_address, 9002+10*instance])
         self._sitl_thread.start()
 
     def _handle_sitl(self, sitl_address: str = "127.0.0.1", port: int = 9002):
@@ -157,15 +159,17 @@ class WebotsArduVehicle():
         """
 
         # create a local UDP socket server to listen for SITL
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # SOCK_STREAM
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # SOCK_STREAM
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(('0.0.0.0', port))
 
         # wait for SITL to connect
-        print(f"Listening for ardupilot SITL (I{self._instance}) at 0.0.0.0:{port}")
-        self.robot.step(self._timestep) # flush print in webots console
+        print(
+            f"Listening for ardupilot SITL (I{self._instance}) at 0.0.0.0:{port}")
+        self.robot.step(self._timestep)  # flush print in webots console
 
-        while not select.select([s], [], [], 0)[0]: # wait for socket to be readable
+        # wait for socket to be readable
+        while not select.select([s], [], [], 0)[0]:
             # if webots is closed, close the socket and exit
             if self.robot.step(self._timestep) == -1:
                 s.close()
@@ -191,12 +195,13 @@ class WebotsArduVehicle():
                     continue
 
                 # parse a single struct
-                command = struct.unpack(self.controls_struct_format, data[:self.controls_struct_size])
+                command = struct.unpack(
+                    self.controls_struct_format, data[:self.controls_struct_size])
                 self._handle_controls(command)
 
                 # wait until the next Webots time step as no new sensor data will be available until then
                 step_success = self.robot.step(self._timestep)
-                if step_success == -1: # webots closed
+                if step_success == -1:  # webots closed
                     break
 
         # if we leave the main loop then Webots must have closed
@@ -256,7 +261,8 @@ class WebotsArduVehicle():
         if self._uses_propellers:
             # `Thrust = thrust_constant * |omega| * omega` (ref https://cyberbotics.com/doc/reference/propeller)
             # if we set `omega = sqrt(input_thottle)` then `Thrust = thrust_constant * input_thottle`
-            linearized_motor_commands = [np.sqrt(np.abs(v))*np.sign(v) for v in command_motors]
+            linearized_motor_commands = [
+                np.sqrt(np.abs(v))*np.sign(v) for v in command_motors]
 
         # reverse motors if desired
         if self._reversed_motors:
@@ -265,7 +271,8 @@ class WebotsArduVehicle():
 
         # set velocities of the motors in Webots
         for i, m in enumerate(self._motors):
-            m.setVelocity(linearized_motor_commands[i] * min(m.getMaxVelocity(), self.motor_velocity_cap))
+            m.setVelocity(
+                linearized_motor_commands[i] * min(m.getMaxVelocity(), self.motor_velocity_cap))
 
     def _handle_image_stream(self, camera: Union[Camera, RangeFinder], port: int):
         """Stream grayscale images over TCP
@@ -291,7 +298,7 @@ class WebotsArduVehicle():
                   f"({cam_width}x{cam_height} @ {1000/cam_sample_period:0.2f}fps)")
         else:
             print(sys.stderr, f"Error: camera passed to _handle_image_stream is of invalid type "
-                              f"'{type(camera)}' (I{self._instance})")
+                  f"'{type(camera)}' (I{self._instance})")
             return
 
         # create a local TCP socket server
@@ -351,8 +358,9 @@ class WebotsArduVehicle():
     def get_camera_image(self) -> np.ndarray:
         """Get the RGB image from the camera as a numpy array of bytes"""
         img = self.camera.getImage()
-        img = np.frombuffer(img, np.uint8).reshape((self.camera.getHeight(), self.camera.getWidth(), 4))
-        return img[:, :, :3] # RGB only, no Alpha
+        img = np.frombuffer(img, np.uint8).reshape(
+            (self.camera.getHeight(), self.camera.getWidth(), 4))
+        return img[:, :, :3]  # RGB only, no Alpha
 
     def get_rangefinder_image(self, use_int16: bool = False) -> np.ndarray:
         """Get the rangefinder depth image as a numpy array of int8 or int16"""\
@@ -369,7 +377,8 @@ class WebotsArduVehicle():
 
         # normalize and set unknown values to max range
         range_range = self.rangefinder.getMaxRange() - self.rangefinder.getMinRange()
-        img_normalized = (img_floats - self.rangefinder.getMinRange()) / range_range
+        img_normalized = (
+            img_floats - self.rangefinder.getMinRange()) / range_range
         img_normalized[img_normalized == float('inf')] = 1
 
         # convert to int8 or int16, allowing for the option of higher precision if desired

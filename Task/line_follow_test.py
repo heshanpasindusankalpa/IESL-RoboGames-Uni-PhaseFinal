@@ -77,7 +77,7 @@ KD_LAT = 0.0001      # m/s per (pixel/s) — dampens lateral oscillation
 THRESHOLD = 155         # binary threshold for line detection
 # ignore top 40% → see 60% of frame (more look-ahead on curves)
 ROI_TOP_FRAC = 0.40
-ALTITUDE = 1.5       # m — cruise altitude
+ALTITUDE = 2.5       # m — cruise altitude
 
 MAX_YAW = 0.50        # rad/s — enough for 90° bends
 MAX_LAT = 0.12        # m/s  — enough for lateral centering
@@ -93,20 +93,20 @@ HIGH_BEND_MAX_YAW = 1.50
 HIGH_BEND_SLEW = 1.00
 
 # Tag centering for landing alignment
-TAG_ALIGN_P_LAT = 0.0025  # m/s per pixel error (lateral)
-TAG_ALIGN_P_FWD = 0.0025  # m/s per pixel error (forward)
-TAG_ALIGN_MAX_VEL = 0.15    # m/s max velocity for alignment
-TAG_ALIGN_DEADZONE = 15     # pixels alignment tolerance
+TAG_ALIGN_P_LAT = 0.0015  # m/s per pixel error (lateral)
+TAG_ALIGN_P_FWD = 0.0015  # m/s per pixel error (forward)
+TAG_ALIGN_MAX_VEL = 0.12    # m/s max velocity for alignment
+TAG_ALIGN_DEADZONE = 25     # pixels alignment tolerance
 
 # Pre-landing precision gate (land only when tag is centered and stable)
 PRE_LAND_OFFSET_X = 0       # pixels: +right / -left target offset from image center
 # pixels: +down / -up target offset (camera geometry bias)
 PRE_LAND_OFFSET_Y = 10
-PRE_LAND_DEADZONE_X = 10    # pixels
-PRE_LAND_DEADZONE_Y = 10    # pixels
-PRE_LAND_LOCK_FRAMES = 8    # require this many centered frames before LAND
+PRE_LAND_DEADZONE_X = 80    # pixels
+PRE_LAND_DEADZONE_Y = 80    # pixels
+PRE_LAND_LOCK_FRAMES = 2    # require this many centered frames before LAND
 PRE_LAND_MAX_VEL = 0.10     # m/s while fine-aligning before land
-PRE_LAND_MAX_ALIGN_TIME = 6.0  # seconds before retrying hover-read cycle
+PRE_LAND_MAX_ALIGN_TIME = 20.0  # seconds before retrying hover-read cycle
 
 
 # Dead-zone — suppresses micro-corrections on straights
@@ -134,6 +134,10 @@ TAG_DETECT_INTERVAL = 3
 TAG_MIN_AREA = 800
 TAG_HOVER_TIME = 2.0
 TAG_APPROACH_SLOW = 0.08
+# Accept new tags only when they are near image center.
+# This prevents side-view tags from hijacking line-follow during sharp bends.
+TAG_DETECT_CENTER_DEADZONE_X = 220  # pixels
+TAG_DETECT_CENTER_DEADZONE_Y = 170  # pixels
 # pixels around detected tag polygon (smaller to avoid over-cutting the line)
 TAG_MASK_PAD = 8
 # keep masking last seen tag briefly when detector misses a frame
@@ -265,75 +269,30 @@ def recv_exact(s, n):
 
 def get_frame(s):
     w, h = struct.unpack("<HH", recv_exact(s, 4))
-    return np.frombuffer(recv_exact(s, w * h),
-                         dtype=np.uint8).reshape((h, w))
+    data = recv_exact(s, w * h * 3)
+    # The TCP stream is sending BGR format directly. No need to swap channels!
+    return np.frombuffer(data, dtype=np.uint8).reshape((h, w, 3))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mask + contour filter
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_mask(gray, thresh):
-    _, m = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)
+def make_mask(bgr, _thresh_unused):
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    # Strict yellow bounds for the guiding line
+    lower_yellow = np.array([20, 100, 100], dtype=np.uint8)
+    upper_yellow = np.array([40, 255, 255], dtype=np.uint8)
+    m = cv2.inRange(hsv, lower_yellow, upper_yellow)
+
     k = np.ones((3, 3), np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  k)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
 
-    # Bridge vertical gaps (like AprilTag stand occlusions) without
-    # fattening the line too much horizontally
+    # Bridge vertical gaps
     k_bridge = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 21))
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k_bridge)
     return m
-
-
-def heal_line_after_tag_mask(mask):
-    """
-    Re-bridge short gaps created when a tag region is cut out from the mask.
-    Keep this conservative to avoid joining unrelated blobs.
-    """
-    k_v = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 15))
-    m = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_v)
-    return m
-
-
-def mask_out_tags(mask, tag_detections, roi_y_offset, pad=TAG_MASK_PAD):
-    """
-    Black out regions around detected AprilTags in the binary mask.
-    This prevents tag white squares from being detected as the line.
-
-    Args:
-        mask:            binary mask (ROI coordinates)
-        tag_detections:  list of TagResult (full-frame coordinates)
-        roi_y_offset:    how many pixels the ROI is offset from the top of the frame
-        pad:             extra pixels to black out around each tag
-    """
-    h, w = mask.shape[:2]
-    for tag in tag_detections:
-        # Convert tag corners from full-frame coords to ROI coords
-        poly = tag.corners.copy()
-        poly[:, 1] -= roi_y_offset
-
-        # Skip if polygon is entirely outside ROI vertically
-        if np.all(poly[:, 1] < 0) or np.all(poly[:, 1] >= h):
-            continue
-
-        # Mask polygon + a small dilation margin.
-        # Using the polygon (instead of a big bbox) avoids cutting long
-        # chunks of the yellow line at tag/line joinings.
-        poly_i = np.round(poly).astype(np.int32).reshape((-1, 1, 2))
-        tmp = np.zeros_like(mask)
-        cv2.fillConvexPoly(tmp, poly_i, 255)
-
-        if pad > 0:
-            k = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE,
-                (2 * pad + 1, 2 * pad + 1)
-            )
-            tmp = cv2.dilate(tmp, k, iterations=1)
-
-        mask[tmp > 0] = 0
-
-    return mask
 
 
 def keep_line_contour(mask, prev_cx=None, min_area=120, min_thickness=12,
@@ -420,12 +379,12 @@ def keep_line_contour(mask, prev_cx=None, min_area=120, min_thickness=12,
 
         # Penalize fence-like candidates (side-edge + border hugging)
         penalty = 0.0
-        if not touches_bottom:
-            penalty += 30.0
+        # If we are jumping over an AprilTag, the line might NOT touch the bottom!
+        # Do not penalize if it doesn't touch the bottom to allow floating segments.
         if near_side_edge:
-            penalty += 65.0
+            penalty += 0.0
         if hugs_border:
-            penalty += 35.0
+            penalty += 0.0
 
         # Slight reward for larger (more stable) contour
         area_reward = min(cv2.contourArea(cnt) / 250.0, 20.0)
@@ -504,6 +463,25 @@ def tag_align_command(tag: TagResult,
     return vx, vy, float(err_x), float(err_y), centered
 
 
+def tag_is_centered(tag: TagResult,
+                    frame_shape,
+                    target_offset_x=0.0,
+                    target_offset_y=0.0,
+                    deadzone_x=80.0,
+                    deadzone_y=80.0) -> tuple[bool, float, float]:
+    """Check whether a tag center is inside a configurable image deadzone."""
+    h, w = frame_shape[:2]
+    cx, cy = tag.center
+
+    target_x = (w / 2) + target_offset_x
+    target_y = (h / 2) + target_offset_y
+
+    err_x = float(cx - target_x)
+    err_y = float(cy - target_y)
+    centered = abs(err_x) <= deadzone_x and abs(err_y) <= deadzone_y
+    return centered, err_x, err_y
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Display
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,7 +491,7 @@ def draw_ann(roi, mask, result, frame_w, error, vy, yr, nav_state,
              tag_info_str, targets_remaining):
     h, w = roi.shape[:2]
     cx = w // 2
-    vis = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
+    vis = roi.copy()
 
     # Center dashed line
     for y in range(0, h, 12):
@@ -697,15 +675,23 @@ def run():
                 # ── PD yaw controller (time-normalized D) ─────────────────
                 p_yaw = KP_YAW * smooth_angle
                 d_yaw = KD_YAW * (smooth_angle - prev_angle) / dt
+
+                # Cross-coupling: add yaw command based heavily on lateral error when error is large!
+                # If the line is far to the right (+error), we should turn right (+yaw rate).
+                # 0.005 means 100px error -> 0.5 rad/s pure turning.
+                err_yaw = 0.005 * smooth_error
+
                 prev_angle = smooth_angle
 
                 angle_abs = abs(smooth_angle)
-                dynamic_max_yaw = HIGH_BEND_MAX_YAW if angle_abs > HIGH_BEND_ANGLE else MAX_YAW
+                dynamic_max_yaw = HIGH_BEND_MAX_YAW if (
+                    angle_abs > HIGH_BEND_ANGLE or abs(smooth_error) > 80) else MAX_YAW
                 raw_yr = float(
-                    np.clip(p_yaw + d_yaw, -dynamic_max_yaw, dynamic_max_yaw))
+                    np.clip(p_yaw + d_yaw + err_yaw, -dynamic_max_yaw, dynamic_max_yaw))
 
                 # ── Slew rate limiter ─────────────────────────────────────
-                dynamic_slew = HIGH_BEND_SLEW if angle_abs > HIGH_BEND_ANGLE else YAW_SLEW
+                dynamic_slew = HIGH_BEND_SLEW if (
+                    angle_abs > HIGH_BEND_ANGLE or abs(smooth_error) > 80) else YAW_SLEW
                 yr_cmd = float(np.clip(
                     raw_yr,
                     prev_yr - dynamic_slew,
@@ -720,17 +706,19 @@ def run():
                 vy_cmd = float(np.clip(p_lat + d_lat, -MAX_LAT, MAX_LAT))
 
                 # At sharp turns, prioritize heading over lateral correction
-                if angle_abs > HIGH_BEND_ANGLE:
+                if angle_abs > HIGH_BEND_ANGLE or abs(smooth_error) > 80:
                     vy_cmd *= 0.4
 
                 # ── Determine forward speed based on nav state ────────────
                 # (TAG_HOVER and TAG_REACQUIRE handled separately below)
                 # Slow down at sharp bends so drone has time to turn
-                if angle_abs > BEND_SLOW_ANGLE:
-                    # Scale from 100% at BEND_SLOW_ANGLE to 40% at 90°
-                    scale = max(
-                        0.4, 1.0 - (angle_abs - BEND_SLOW_ANGLE) / 90.0)
-                    fwd_speed = FORWARD_SPEED * scale
+                if angle_abs > BEND_SLOW_ANGLE or abs(smooth_error) > 80:
+                    # Scale based on angle or extreme lateral drift
+                    scale_ang = max(0.4, 1.0 - (angle_abs - BEND_SLOW_ANGLE) /
+                                    90.0) if angle_abs > BEND_SLOW_ANGLE else 1.0
+                    scale_lat = max(
+                        0.2, 1.0 - (abs(smooth_error) - 80) / 150.0) if abs(smooth_error) > 80 else 1.0
+                    fwd_speed = FORWARD_SPEED * min(scale_ang, scale_lat)
                 else:
                     fwd_speed = FORWARD_SPEED
 
@@ -800,6 +788,10 @@ def run():
                 else:
                     pre_land_lock_count = max(0, pre_land_lock_count - 1)
 
+                if frame_count % 10 == 0:
+                    print(
+                        f"  [PRE_LAND_ALIGN] err_x={err_x:+.1f}px err_y={err_y:+.1f}px vx={vx_align:+.3f} vy={vy_align:+.3f} lock={pre_land_lock_count}/{PRE_LAND_LOCK_FRAMES}")
+
                 tag_info_str = (
                     f"Pre-land align ex={err_x:+.1f}px ey={err_y:+.1f}px "
                     f"lock={pre_land_lock_count}/{PRE_LAND_LOCK_FRAMES}"
@@ -807,6 +799,7 @@ def run():
                 send_velocity(master, vx=vx_align, vy=vy_align, yaw_rate=0.0)
             else:
                 send_velocity(master)
+                pre_land_lock_count = max(0, pre_land_lock_count - 1)
 
         elif nav_state == NavState.TAG_REACQUIRE:
             # Creeping forward slowly to re-find the line after skipping a tag
@@ -829,13 +822,21 @@ def run():
             time.sleep(0.01)
             continue
 
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
         # ── Perception: AprilTag detection (on full frame, BEFORE line) ────
         frame_w = frame.shape[1]
         roi_y = int(frame.shape[0] * ROI_TOP_FRAC)
 
         # Detect tags: periodically normally, or EVERY frame while aligning/hovering
         if (frame_count % TAG_DETECT_INTERVAL == 0) or (nav_state in (NavState.TAG_HOVER, NavState.PRE_LAND_ALIGN)):
-            last_tag_detections = tag_detector.detect(frame)
+            last_tag_detections = tag_detector.detect(gray_frame)
+
+            if not last_tag_detections and tag_mask_hold > 0:
+                # Use memory if we dropped a frame
+                last_tag_detections = tag_mask_memory
+                tag_mask_hold -= 1
+
             if last_tag_detections:
                 tag_mask_memory = list(last_tag_detections)
                 tag_mask_hold = TAG_MASK_HOLD_FRAMES
@@ -844,7 +845,18 @@ def run():
 
                 # State machine: detect → TAG_HOVER immediately
                 if following and nav_state == NavState.LINE_FOLLOW:
-                    if best_tag.tag_id not in visited_tags:
+                    centered_for_capture, cap_ex, cap_ey = tag_is_centered(
+                        best_tag,
+                        frame.shape,
+                        target_offset_x=0.0,
+                        target_offset_y=0.0,
+                        deadzone_x=TAG_DETECT_CENTER_DEADZONE_X,
+                        deadzone_y=TAG_DETECT_CENTER_DEADZONE_Y,
+                    )
+
+                    if (best_tag.tag_id not in visited_tags
+                            and area > TAG_MIN_AREA
+                            and centered_for_capture):
                         nav_state = NavState.TAG_HOVER
                         current_tag = best_tag
                         tag_hover_start = time.time()
@@ -859,29 +871,21 @@ def run():
                         print(f"\n[Nav] Tag detected! {best_tag}")
                         print(
                             f"[Nav] → TAG_HOVER (area={area:.0f}, hovering for {TAG_HOVER_TIME}s)")
+                    elif best_tag.tag_id not in visited_tags and area > TAG_MIN_AREA:
+                        tag_info_str = (
+                            f"Tag seen but off-center ex={cap_ex:+.0f}px ey={cap_ey:+.0f}px"
+                        )
 
                 elif nav_state in (NavState.TAG_HOVER, NavState.PRE_LAND_ALIGN):
                     # Update tag detection while hovering / pre-landing align
                     current_tag = best_tag
+            else:
+                if nav_state == NavState.TAG_HOVER:
+                    current_tag = None
 
-        # ── Perception: Line detection (with tag regions masked out) ──────
+        # ── Perception: Line detection ──────
         roi = frame[roi_y:, :]
         mask = make_mask(roi, thresh[0])
-
-        # Black out tag regions so they don't confuse line detection.
-        # If detector briefly misses, keep using recent tag corners for a few frames.
-        tags_for_mask = last_tag_detections
-        if not tags_for_mask and tag_mask_hold > 0 and tag_mask_memory:
-            tags_for_mask = tag_mask_memory
-            tag_mask_hold -= 1
-
-        if tags_for_mask:
-            mask = mask_out_tags(mask, tags_for_mask,
-                                 roi_y, pad=TAG_MASK_PAD)
-            mask = heal_line_after_tag_mask(mask)
-        else:
-            tag_mask_hold = 0
-            tag_mask_memory = []
 
         mask, prev_line_cx = keep_line_contour(mask, prev_cx=prev_line_cx)
 
@@ -896,7 +900,7 @@ def run():
             elapsed = time.time() - tag_hover_start
             if elapsed >= TAG_HOVER_TIME:
                 # Re-read tag one more time for best accuracy
-                final_tags = tag_detector.detect(frame)
+                final_tags = tag_detector.detect(gray_frame)
                 if final_tags:
                     current_tag = max(final_tags, key=tag_corner_area)
 
@@ -915,13 +919,28 @@ def run():
 
             if (current_tag.country_code in targets_remaining
                     and current_tag.is_landable):
-                # This is a target airport — first do precise centering, then land.
+                # This is a target airport — if centered already, land immediately.
+                centered_now, ex_now, ey_now = tag_is_centered(
+                    current_tag,
+                    frame.shape,
+                    target_offset_x=PRE_LAND_OFFSET_X,
+                    target_offset_y=PRE_LAND_OFFSET_Y,
+                    deadzone_x=PRE_LAND_DEADZONE_X,
+                    deadzone_y=PRE_LAND_DEADZONE_Y,
+                )
+
                 print(
                     f"[Nav] ✅ MATCH! Country {current_tag.country_code} is landable!")
                 nav_state = NavState.PRE_LAND_ALIGN
                 pre_land_start = time.time()
-                pre_land_lock_count = 0
+                pre_land_lock_count = PRE_LAND_LOCK_FRAMES if centered_now else 0
                 tag_info_str = f"Target {current_tag.tag_id}: fine-aligning before landing"
+                if centered_now:
+                    print(
+                        f"[Nav] Tag already centered ex={ex_now:+.1f}px ey={ey_now:+.1f}px → landing")
+                else:
+                    print(
+                        f"[Nav] Centering before land ex={ex_now:+.1f}px ey={ey_now:+.1f}px")
                 print("[Nav] → PRE_LAND_ALIGN")
             else:
                 # Not a match — skip and creep forward to re-find line
@@ -980,10 +999,26 @@ def run():
 
             # If we can't lock alignment quickly, restart hover-read cycle.
             elif (time.time() - pre_land_start) > PRE_LAND_MAX_ALIGN_TIME:
-                print("[Nav] Pre-land alignment timeout — retrying TAG_HOVER")
-                nav_state = NavState.TAG_HOVER
-                tag_hover_start = time.time()
-                pre_land_lock_count = 0
+                coarse_centered = False
+                if current_tag is not None:
+                    coarse_centered, _, _ = tag_is_centered(
+                        current_tag,
+                        frame.shape,
+                        target_offset_x=PRE_LAND_OFFSET_X,
+                        target_offset_y=PRE_LAND_OFFSET_Y,
+                        deadzone_x=PRE_LAND_DEADZONE_X * 1.5,
+                        deadzone_y=PRE_LAND_DEADZONE_Y * 1.5,
+                    )
+
+                if coarse_centered and current_tag is not None:
+                    print(
+                        "[Nav] Pre-land timeout, but tag is still near center → landing")
+                    pre_land_lock_count = PRE_LAND_LOCK_FRAMES
+                else:
+                    print("[Nav] Pre-land alignment timeout — retrying TAG_HOVER")
+                    nav_state = NavState.TAG_HOVER
+                    tag_hover_start = time.time()
+                    pre_land_lock_count = 0
 
         # ── State machine: TAG_REACQUIRE → LINE_FOLLOW ───────────────────
         if nav_state == NavState.TAG_REACQUIRE:
@@ -1008,10 +1043,11 @@ def run():
             fps = 15 / (t_now - t_prev + 1e-6)
             t_prev = t_now
         if following and frame_count % 20 == 0:
-            print(f"  [{nav_state.name}] conf={result.confidence:.2f}  "
-                  f"err={error:+5.1f}px  "
-                  f"ang={result.angle_deg:+5.1f}°  "
-                  f"vy={vy_cmd:+.3f}  yr={yr_cmd:+.3f}")
+            if nav_state in (NavState.LINE_FOLLOW, NavState.TAG_REACQUIRE):
+                print(f"  [{nav_state.name}] conf={result.confidence:.2f}  "
+                      f"err={error:+5.1f}px  "
+                      f"ang={result.angle_deg:+5.1f}°  "
+                      f"vy={vy_cmd:+.3f}  yr={yr_cmd:+.3f}")
 
         # ── Display ───────────────────────────────────────────────────────
         ann = draw_ann(roi, mask, result, frame_w, error,
@@ -1022,7 +1058,7 @@ def run():
         msk = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
         # Full frame with tag overlay
-        full_vis = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        full_vis = frame.copy()
         if last_tag_detections:
             draw_tags_on_frame(full_vis, last_tag_detections)
 
