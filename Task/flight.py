@@ -14,6 +14,7 @@ Changes vs previous version:
 
 from perception.line_detector import LineDetector, LineDetectorConfig, Strategy
 from perception.apriltag_detector import AprilTagDetector, TagResult
+from navigation.mission_planner import MissionPlanner
 import math
 import socket
 import struct
@@ -233,14 +234,16 @@ def make_mask(bgr, _thresh_unused):
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k_bridge)
     return m
 
-
-def keep_line_contour(mask, prev_cx=None, min_area=120, min_thickness=12,
-                      border_margin=BORDER_MARGIN_PX, edge_penalty_margin=EDGE_PENALTY_PX):
-    h, w = mask.shape[:2]
+def keep_valid_contours(mask, min_area=120, min_thickness=12):
+    """
+    Filters out noise but keeps ALL valid line branches 
+    so the graph algorithm can see junctions.
+    """
     contours, _ = cv2.findContours(
         mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
     if not contours:
-        return mask, prev_cx
+        return mask
 
     def _filter_contours(cnts, thickness_limit):
         valid = []
@@ -255,42 +258,15 @@ def keep_line_contour(mask, prev_cx=None, min_area=120, min_thickness=12,
 
     candidates = _filter_contours(contours, min_thickness)
     if not candidates:
+        # Fallback to looser thickness constraint if needed
         candidates = _filter_contours(contours, 8)
 
     clean = np.zeros_like(mask)
-    if not candidates:
-        return clean, prev_cx
-
-    desired_x = prev_cx if prev_cx is not None else (w / 2)
-
-    def _score(cnt):
-        M = cv2.moments(cnt)
-        cx = M["m10"] / M["m00"] if M["m00"] > 0 else (w / 2)
-        pts = cnt.reshape(-1, 2)
-        ys = pts[:, 1]
-        bot_xs = pts[:, 0][ys >= h - 6]
-        bottom_x = float(np.mean(bot_xs)) if len(bot_xs) else float(cx)
-
-        continuity = 0.75 * abs(cx - desired_x) + 0.25 * \
-            abs(bottom_x - desired_x)
-        area_reward = min(cv2.contourArea(cnt) / 250.0, 20.0)
-
-        penalty = 0.0
-        x1, y1, bw, bh = cv2.boundingRect(cnt)
-        hugs_border   = (x1 <= 15) or ((x1 + bw) >= (w - 15))
-        touches_bottom = np.any(ys >= (h - 15))
-        if hugs_border and not touches_bottom:
-            penalty += 500.0
-
-        return continuity + penalty - area_reward
-
-    best = min(candidates, key=_score)
-    M = cv2.moments(best)
-    new_cx = M["m10"] / M["m00"] if M["m00"] > 0 else prev_cx
-
-    cv2.drawContours(clean, [best], -1, 255, thickness=cv2.FILLED)
-    return clean, new_cx
-
+    if candidates:
+        # Draw ALL valid branches, not just the "best" one
+        cv2.drawContours(clean, candidates, -1, 255, thickness=cv2.FILLED)
+        
+    return clean
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Smoothing & Tag helpers
@@ -354,6 +330,12 @@ def draw_ann(roi, mask, result, frame_w, error, vy, yr, nav_state,
 
     for y in range(0, h, 12):
         cv2.line(vis, (cx, y), (cx, min(y+6, h)), (255, 255, 0), 1)
+
+    if result.junction_detected:
+        cv2.putText(vis, "JUNCTION DETECTED", (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        for bx in result.branch_centroids:
+            # Draw bright cyan circles at the split points to prove it sees all lines
+            cv2.circle(vis, (int(bx), result.junction_y), 8, (255, 255, 0), 2)
 
     if result.is_detected:
         for sx, sy in result.slice_points:
@@ -429,6 +411,10 @@ def run():
     detector = LineDetector(LineDetectorConfig(
         strategy=Strategy.SLIDING_WINDOW, num_slices=6, min_pixels=8))
     tag_detector = AprilTagDetector(quad_decimate=1.0, nthreads=2)
+
+    planner = MissionPlanner(Airports)
+    current_turn_bias = "straight"
+    junction_cooldown = 0
 
     cv2.namedWindow("Annotated ROI", cv2.WINDOW_NORMAL)
     cv2.namedWindow("Binary mask",   cv2.WINDOW_NORMAL)
@@ -601,7 +587,6 @@ def run():
                             print("[Nav] Line lost! Expanding to FULL FRAME search and halting.")
                             roi_active = False    # Expand vision
                             aligning = True       # Force alignment when found again
-                            prev_line_cx = None   # Clear contour memory
 
             elif nav_state == NavState.TAG_HOVER:
                 if current_tag:
@@ -726,9 +711,19 @@ def run():
         else:
             roi = frame           # full frame search
 
-        mask, prev_line_cx = keep_line_contour(
-            make_mask(roi, thresh[0]), prev_cx=prev_line_cx)
-        result = detector.detect(mask)
+        mask = keep_valid_contours(make_mask(roi, thresh[0]))
+        if junction_cooldown > 0:
+            junction_cooldown -= 1
+        else:
+            current_turn_bias = "straight"
+
+        result = detector.detect(mask, turn_bias=current_turn_bias)
+        
+        if result.junction_detected and following:
+            current_turn_bias = planner.get_junction_decision(len(result.branch_centroids))
+            result = detector.detect(mask, turn_bias=current_turn_bias) # Re-run with the forced bias
+            junction_cooldown = 10 # Hold the turn bias for 10 frames to ensure it commits to the branch
+            
         error  = result.lateral_error(frame_w)
 
         # ── ROI acquisition timer ─────────────────────────────────────────
@@ -765,14 +760,14 @@ def run():
                     print("[Nav] Lost tag during read — back to LINE_FOLLOW")
 
         if nav_state == NavState.DECIDING and current_tag is not None:
-            visited_tags.add(current_tag.tag_id)
-            if (current_tag.country_code in targets_remaining and current_tag.is_landable):
+            should_land = planner.on_tag_reached(current_tag.tag_id, current_tag.country_code, current_tag.is_landable)
+            
+            if should_land:
                 centered_now, ex_now, ey_now = tag_is_centered(
                     current_tag, frame.shape, target_offset_x=PRE_LAND_OFFSET_X,
                     target_offset_y=PRE_LAND_OFFSET_Y, deadzone_x=PRE_LAND_DEADZONE_X,
                     deadzone_y=PRE_LAND_DEADZONE_Y)
-                print(
-                    f"[Nav] ✅ MATCH! Country {current_tag.country_code} is landable!")
+                print(f"[Nav] ✅ MATCH! Country {current_tag.country_code} is landable!")
                 nav_state           = NavState.PRE_LAND_ALIGN
                 pre_land_start      = time.time()
                 pre_land_lock_count = PRE_LAND_LOCK_FRAMES if centered_now else 0
@@ -839,8 +834,7 @@ def run():
                 nav_state    = NavState.LINE_FOLLOW
                 aligning     = True
                 prev_yr      = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
-                t_ctrl       = time.time()
-                prev_line_cx = None
+                t_ctrl       = time.time()                
                 tag_info_str = f"Line re-acquired — targets: {targets_remaining}"
                 print("[Nav] Line re-acquired! → LINE_FOLLOW")
 
@@ -856,7 +850,6 @@ def run():
                         aligning     = True
                         prev_yr      = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
                         t_ctrl       = time.time()
-                        prev_line_cx = None
                         print(
                             f"[Nav] Valid outgoing line found at {current_heading:.0f}°! → LINE_FOLLOW")
                     else:

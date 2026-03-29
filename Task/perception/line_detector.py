@@ -48,19 +48,18 @@ class LineResult:
     centroid_x:   float        # x pixel in ROI coords
     angle_deg:    float        # degrees, 0 = straight ahead, + = leaning right
     confidence:   float        # 0.0 – 1.0
-    # [(x,y),...] for visualizer
     slice_points: list = field(default_factory=list)
+    
+    # --- NEW: Graph & Junction Data ---
+    junction_detected: bool = False
+    branch_centroids: list[float] = field(default_factory=list) # X-coords of all branches
+    junction_y: int = 0                                         # Y-coord where the split happens
 
     @property
     def is_detected(self) -> bool:
         return self.confidence > 0.0
 
-    # Error relative to frame center — this is what the PID receives
     def lateral_error(self, frame_width: int) -> float:
-        """
-        Positive  → line is to the RIGHT of center → drone should move right.
-        Negative  → line is to the LEFT  of center → drone should move left.
-        """
         return self.centroid_x - (frame_width / 2)
 
 
@@ -106,18 +105,13 @@ class LineDetector:
     # Public API
     # ------------------------------------------------------------------
 
-    def detect(self, mask: np.ndarray) -> LineResult:
+    def detect(self, mask: np.ndarray, turn_bias: str = "straight") -> LineResult:
         """
-        Run line detection on a binary mask.
-
-        Args:
-            mask: uint8 binary image (0/255) from Preprocessor.process()
-
-        Returns:
-            LineResult — always returned, check .is_detected or .confidence
+        Run line detection. turn_bias allows the graph algorithm to steer the drone 
+        ("left", "right", "straight") when multiple branches are detected.
         """
         if self.cfg.strategy == Strategy.SLIDING_WINDOW:
-            return self._sliding_window(mask)
+            return self._sliding_window(mask, turn_bias)
         else:
             return self._hough(mask)
 
@@ -125,85 +119,64 @@ class LineDetector:
     # Strategy A: Sliding window (with Branch Lock)
     # ------------------------------------------------------------------
 
-    def _sliding_window(self, mask: np.ndarray) -> LineResult:
-        """
-        Scan the mask in horizontal slices from bottom to top.
-        Each slice votes with its centroid x if it has enough white pixels.
-        """
+    def _sliding_window(self, mask: np.ndarray, turn_bias: str) -> LineResult:
         h, w = mask.shape
         slice_h = h // self.cfg.num_slices
 
-        valid_points = []   # (x, y) centroids of valid slices
-        
-        # Start looking for the line near the center of the bottom of the frame
+        valid_points = []
         current_target_x = w / 2.0 
+        
+        # Junction tracking state
+        j_detected = False
+        j_branches = []
+        j_y = 0
 
         for i in range(self.cfg.num_slices):
-            # Work bottom-up: slice 0 = bottom (closest to drone)
             y_bot = h - i * slice_h
             y_top = max(y_bot - slice_h, 0)
-
             strip = mask[y_top:y_bot, :]
             
-            # Pass the target_x to help the function choose the correct branch at a junction
-            cx = self._centroid_x(strip, target_x=current_target_x)
+            # Pass the bias down to the centroid calculator
+            cx, all_centers = self._centroid_x(strip, target_x=current_target_x, turn_bias=turn_bias)
+            
+            # If we see multiple distinct lines in this horizontal slice, it's a junction!
+            if len(all_centers) > 1:
+                j_detected = True
+                j_branches = all_centers
+                j_y = (y_top + y_bot) // 2
 
             if cx is not None:
                 y_mid = (y_top + y_bot) // 2
                 valid_points.append((cx, y_mid))
-                # Update the target_x for the next slice up to track this specific branch
                 current_target_x = cx
 
         if len(valid_points) < 2:
-            # Not enough slices fired — no confident detection
             confidence = len(valid_points) / self.cfg.num_slices
             if len(valid_points) == 1:
-                # If only one slice fired (often means horizontal line!),
-                # compute angle strictly pointing towards that centroid from the bottom-center of ROI
                 dx = valid_points[0][0] - (w / 2)
-                dy = valid_points[0][1] - h  # negative since y_mid < h
+                dy = valid_points[0][1] - h
+                angle_deg = float(np.degrees(np.arctan(dx / dy))) if dy != 0 else 0.0
+                return LineResult(centroid_x=valid_points[0][0], angle_deg=angle_deg, confidence=confidence, 
+                                  slice_points=valid_points, junction_detected=j_detected, 
+                                  branch_centroids=j_branches, junction_y=j_y)
+            return LineResult(centroid_x=w / 2, angle_deg=0.0, confidence=0.0, slice_points=[])
 
-                # To match np.polyfit, we use dx/dy.
-                # If the line is to the right (dx > 0), dx/dy < 0, angle should be NEGATIVE.
-                angle_deg = float(np.degrees(
-                    np.arctan(dx / dy))) if dy != 0 else 0.0
-
-                return LineResult(
-                    centroid_x=valid_points[0][0],
-                    angle_deg=angle_deg,
-                    confidence=confidence,
-                    slice_points=valid_points,
-                )
-            return LineResult(centroid_x=w / 2, angle_deg=0.0,
-                              confidence=0.0, slice_points=[])
-
-        # Fit a line through the slice centroids
         xs = np.array([p[0] for p in valid_points], dtype=np.float32)
         ys = np.array([p[1] for p in valid_points], dtype=np.float32)
 
-        # Use a weighted average of slice centroids for positioning.
-        # Bottom slices (closer to drone) get more weight, but including top
-        # slices helps the drone "look ahead" on curves to reduce tracking lag.
         weights = []
         for _, y in valid_points:
-            # y is height in ROI (bottom is larger y)
-            # Give pixels in the bottom half 2x weight vs top half
             w_val = 2.0 if y > h / 2 else 1.0
             weights.append(w_val)
-
         weights = np.array(weights)
+        
         centroid_x = float(np.sum(xs * weights) / np.sum(weights))
-
-        # Angle: fit line, measure deviation from vertical
         angle_deg = self._fit_angle(xs, ys)
-
         confidence = len(valid_points) / self.cfg.num_slices
 
         return LineResult(
-            centroid_x=centroid_x,
-            angle_deg=angle_deg,
-            confidence=confidence,
-            slice_points=valid_points,
+            centroid_x=centroid_x, angle_deg=angle_deg, confidence=confidence, slice_points=valid_points,
+            junction_detected=j_detected, branch_centroids=j_branches, junction_y=j_y
         )
 
     # ------------------------------------------------------------------
@@ -258,33 +231,34 @@ class LineDetector:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _centroid_x(self, strip: np.ndarray, target_x: float) -> float | None:
-        """
-        Return the x centroid of the white pixel cluster closest to the target_x.
-        This prevents averaging left and right branches at a junction.
-        """
+    def _centroid_x(self, strip: np.ndarray, target_x: float, turn_bias: str) -> tuple[float | None, list[float]]:
+        """Returns the chosen centroid AND a list of all branch centroids found."""
         white_cols = np.where(strip > 0)[1]
 
         if len(white_cols) < self.cfg.min_pixels:
-            return None
+            return None, []
             
-        # 1D Clustering: Find gaps > cluster_gap to separate left/right branches
         jumps = np.where(np.diff(white_cols) > self.cfg.cluster_gap)[0]
         branches = np.split(white_cols, jumps + 1)
-        
-        # Calculate the mean X for each distinct branch that meets the pixel threshold
         branch_centers = [np.mean(branch) for branch in branches if len(branch) >= self.cfg.min_pixels]
         
         if not branch_centers:
-            return None
+            return None, []
             
         if len(branch_centers) == 1:
-            return float(branch_centers[0])
+            return float(branch_centers[0]), branch_centers
             
-        # JUNCTION DETECTED: Multiple branches found in this slice.
-        # Pick the branch whose center is closest to the target_x from the slice below
-        best_center = min(branch_centers, key=lambda cx: abs(cx - target_x))
-        return float(best_center)
+        # --- GRAPH NAVIGATION DECISION EXECUTION ---
+        # We are at a split. We physically bias the tracking X based on the graph planner's command.
+        if turn_bias == "left":
+            best_center = min(branch_centers) # Pick the leftmost line
+        elif turn_bias == "right":
+            best_center = max(branch_centers) # Pick the rightmost line
+        else:
+            # Default straight continuity
+            best_center = min(branch_centers, key=lambda cx: abs(cx - target_x))
+            
+        return float(best_center), branch_centers
 
     @staticmethod
     def _fit_angle(xs: np.ndarray, ys: np.ndarray) -> float:
