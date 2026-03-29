@@ -6,18 +6,15 @@ Includes dynamic sensor hand-off, active search, anti-U-turn routing,
 smart fence rejection, and dynamic junction stiffening.
 
 Changes vs previous version:
-  - Auto-starts line following after takeoff (no manual F key needed)
-  - Uses full frame for line detection until the line is held for
-    ROI_ACQUIRE_TIME seconds, then switches to the normal ROI crop
-  - Increased forward/lateral speeds and gain for faster navigation
+  - Uses multi-threaded Camera class to prevent TCP buffer lag during takeoff
+  - Increased stabilization delays to 5s to let the drone settle physically
 """
 
 from perception.line_detector import LineDetector, LineDetectorConfig, Strategy
 from perception.apriltag_detector import AprilTagDetector, TagResult
+from perception.camera import Camera
 from navigation.mission_planner import MissionPlanner
 import math
-import socket
-import struct
 import sys
 import time
 from enum import Enum, auto
@@ -40,14 +37,14 @@ Airports = [1, 2]   # ← set these to the required country codes
 # TUNING
 # ─────────────────────────────────────────────────────────────────────────────
 
-FORWARD_SPEED   = 0.28      # was 0.15 — main cruise speed
-SLOW_SPEED      = 0.15      # was 0.08 — used in TAG_REACQUIRE creep
-CREEP_SPEED     = 0.20      # was 0.15 — manual creep key
+FORWARD_SPEED   = 0.28      # main cruise speed
+SLOW_SPEED      = 0.15      # used in TAG_REACQUIRE creep
+CREEP_SPEED     = 0.20      # manual creep key
 
 KP_YAW = -0.020
 KD_YAW = -0.012
 
-KP_LAT = 0.0005             # more lateral authority at higher speed
+KP_LAT = 0.0005             # lateral authority
 KD_LAT = 0.0003
 
 THRESHOLD    = 155
@@ -56,7 +53,7 @@ ROI_SIDE_FRAC = 0.12
 ALTITUDE     = 1.5
 
 MAX_YAW = 0.50
-MAX_LAT = 0.20              # was 0.12
+MAX_LAT = 0.20
 
 YAW_SLEW = 0.15
 
@@ -79,7 +76,7 @@ PRE_LAND_MAX_ALIGN_TIME = 20.0
 
 YAW_DEAD_ZONE    = 2.0
 LAT_DEAD_ZONE    = 5.0
-EMA_ALPHA        = 0.40
+EMA_ALPHA        = 0.30
 ALIGN_THRESHOLD_DEG = 8.0
 BEND_SLOW_ANGLE  = 15.0
 LINE_LOSS_GRACE  = 15
@@ -186,37 +183,6 @@ def send_velocity(m, vx=0, vy=0, vz=0, yaw_rate=0):
         mavutil.mavlink.MAV_FRAME_BODY_NED,
         0b010111000111, 0, 0, 0,
         vx, vy, vz, 0, 0, 0, 0, yaw_rate)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Camera
-# ─────────────────────────────────────────────────────────────────────────────
-
-def connect_camera(host="127.0.0.1", port=5599):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((host, port))
-    s.settimeout(0.2)
-    print(f"[Camera] Connected to {host}:{port}")
-    return s
-
-
-def recv_exact(s, n):
-    buf = b""
-    while len(buf) < n:
-        try:
-            chunk = s.recv(n - len(buf))
-        except socket.timeout:
-            raise TimeoutError
-        if not chunk:
-            raise ConnectionError
-        buf += chunk
-    return buf
-
-
-def get_frame(s):
-    w, h = struct.unpack("<HH", recv_exact(s, 4))
-    data = recv_exact(s, w * h * 3)
-    return np.frombuffer(data, dtype=np.uint8).reshape((h, w, 3))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -403,10 +369,14 @@ def draw_tags_on_frame(vis, tags):
 def run():
     master = connect()
     arm_and_takeoff(master, ALTITUDE)
-    print("[Test] Stabilizing 2 s ...")
-    time.sleep(2.0)
+    
+    # Wait 5 seconds to let the physical momentum settle
+    print("[Test] Stabilizing 5 s ...")
+    time.sleep(5.0)
 
-    cam = connect_camera()
+    # Initialize the threaded camera so the buffer never fills up
+    cam = Camera(host="127.0.0.1", port=5599)
+    cam.start()
     last_frm = None
 
     detector = LineDetector(LineDetectorConfig(
@@ -616,15 +586,13 @@ def run():
         elif creep:
             send_velocity(master, vx=CREEP_SPEED)
 
-        # ── Read frame ────────────────────────────────────────────────────
-        try:
-            frame = get_frame(cam)
+        # ── Read frame (using non-blocking Threaded Camera) ───────────────
+        fetched_frame = cam.get_frame()
+        if fetched_frame is not None:
+            frame = fetched_frame
             last_frm = frame
-        except TimeoutError:
+        else:
             frame = last_frm
-        except ConnectionError as e:
-            print(f"[Camera] {e}")
-            break
 
         if frame is None:
             time.sleep(0.01)
@@ -798,7 +766,11 @@ def run():
                     else:
                         print("[Nav] Re-taking off to continue mission ...")
                         arm_and_takeoff(master, ALTITUDE)
-                        time.sleep(2.0)
+                        
+                        # Fix applied here: Wait 5 seconds dynamically while camera 
+                        # safely continues draining the queue in the background
+                        print("[Nav] Stabilizing 5 s ...")
+                        time.sleep(5.0)
 
                         # Reset vision trackers for the new flight
                         prev_line_cx        = None
@@ -897,7 +869,7 @@ def run():
             send_velocity(master)
             print("[Manual] Stopped")
 
-    cam.close()
+    cam.stop()
     cv2.destroyAllWindows()
     print("[Test] Done.")
 
