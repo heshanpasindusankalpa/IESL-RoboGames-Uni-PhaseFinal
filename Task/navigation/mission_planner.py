@@ -1,8 +1,7 @@
-"""
-navigation/mission_planner.py
+"""Mission planning state and junction decision logic.
 
-Handles graph traversal logic, tracking visited airports (nodes),
-and making routing decisions at junctions (edges).
+Tracks visited AprilTag nodes and resolves branch choices based on
+a deterministic exploration policy.
 """
 
 from enum import Enum
@@ -23,15 +22,19 @@ class MissionPlanner:
         self.default_routing_rule = TurnDecision.LEFT
 
     def on_tag_reached(self, tag_id: int, country_code: int, is_landable: bool) -> bool:
-        """
-        Registers a visited node in the graph.
-        Returns True if the drone should land here.
+        """Mark tag as visited and evaluate landing condition.
+
+        Args:
+            tag_id: Unique AprilTag identifier.
+            country_code: First digit code from tag payload.
+            is_landable: True when airport is declared safe.
+
+        Returns:
+            True if this node is still a pending mission target and can land.
         """
         self.visited_tags.add(tag_id)
-        
-        if country_code in self.targets and is_landable:
-            return True
-        return False
+
+        return country_code in self.targets and is_landable
 
     def on_target_landed(self, country_code: int):
         """Removes the country from the target list after a successful landing."""
@@ -42,11 +45,14 @@ class MissionPlanner:
         return len(self.targets) == 0
 
     def get_junction_decision(self, branch_count: int) -> str:
-        """
-        Called when the vision system detects a fork in the road.
-        Returns the routing bias ("left", "right", or "straight").
+        """Determine trajectory bias at detected junction.
+
+        Args:
+            branch_count: number of active line branches in current view.
+
+        Returns:
+            Direction string from policy: left/right/straight.
         """
         if branch_count > 1:
-            # We hit a junction. Apply the maze solving rule to pick a path.
             return self.default_routing_rule.value
         return TurnDecision.STRAIGHT.value

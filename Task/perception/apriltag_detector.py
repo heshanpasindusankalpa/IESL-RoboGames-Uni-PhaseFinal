@@ -1,18 +1,9 @@
-"""
-perception/apriltag_detector.py
+"""AprilTag detection and airport-code decoding.
 
-Detects and decodes AprilTags (family tag36h11) from grayscale camera frames.
-
-Each tag encodes a three-digit number:
-    Digit 1 → Country Code
-    Digit 2 → Airport Status  (1 = safe to land, 0 = unsafe)
-    Digit 3 → Number of other airports reachable from this airport
-
-Usage:
-    detector = AprilTagDetector()
-    results  = detector.detect(gray_frame)
-    for tag in results:
-        print(tag.tag_id, tag.country_code, tag.is_landable, tag.reachable)
+Parses tag36h11 payloads as three-digit airport identifiers:
+- country_code (digit 1),
+- airport_status (digit 2; 1=landable),
+- reachable airport count (digit 3).
 """
 
 from __future__ import annotations

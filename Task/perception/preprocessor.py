@@ -135,16 +135,6 @@ class Preprocessor:
         closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, self._kernel)
         return closed
 
-
-# ---------------------------------------------------------------------------
-# Live HSV tuner — run this file directly to tune thresholds interactively
-#
-#   python perception/preprocessor.py
-#
-# Adjust the sliders until the line is clean white and background is black.
-# Copy the printed values into PreprocessorConfig or params.yaml.
-# ---------------------------------------------------------------------------
-
 def _run_tuner():
     """Interactive HSV tuner using trackbars. Press Q to quit."""
     import sys

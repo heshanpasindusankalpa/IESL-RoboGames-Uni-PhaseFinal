@@ -1,7 +1,8 @@
-"""
-Camera interface for the drone line follower.Receives frames over TCP from a camera server .
-"""
+"""TCP camera client with asynchronous frame plumbing.
 
+The client pulls raw BGR frames from a remote server, stores the
+latest frame under lock, and provides a non-blocking getter.
+"""
 import socket
 import struct
 import threading

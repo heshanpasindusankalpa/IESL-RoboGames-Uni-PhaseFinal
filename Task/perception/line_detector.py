@@ -1,27 +1,13 @@
-"""
-perception/line_detector.py
+"""Line detection for segmented ROI masks.
 
-Takes the binary mask from Preprocessor and returns the line's
-centroid position, heading angle, and a confidence score.
+This module converts a binary line mask into a continuous heading estimate.
+Supports:
+- sliding-window centroid tracing with junction-aware branch selection,
+- Hough line fitting for straight segment inference.
 
-Two detection strategies are available and can be selected via config:
-
-  Strategy.SLIDING_WINDOW  — best for curved lines (your arena)
-      Divides the mask into N horizontal slices.
-      Finds the centroid of white pixels in each slice.
-      Utilizes 1D spatial clustering to prevent averaging at junctions.
-      Fits a line through those centroids.
-
-  Strategy.HOUGH           — best for straight segments, fast
-      Runs Canny edge detection on the mask.
-      Applies HoughLinesP to find line segments.
-      Averages segment midpoints for centroid.
-
-Output: LineResult dataclass
-    centroid_x  : float  — x position of line center in ROI pixel coords
-    angle_deg   : float  — heading angle of line (-90 to +90 deg, 0 = vertical)
-    confidence  : float  — 0.0 (no line) to 1.0 (strong detection)
-    slice_points: list   — [(x, y), ...] centroids per slice (debug / visualizer)
+Outputs:
+    LineResult: centroid x position, heading angle in degrees, confidence score,
+    slice points for debugging and optional junction state.
 """
 
 from __future__ import annotations

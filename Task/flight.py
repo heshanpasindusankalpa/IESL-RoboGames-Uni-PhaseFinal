@@ -1,15 +1,3 @@
-"""
-Task/flight.py
-
-Autonomous drone line follower with AprilTag-based airport navigation.
-Includes dynamic sensor hand-off, active search, anti-U-turn routing,
-smart fence rejection, and dynamic junction stiffening.
-
-Changes vs previous version:
-  - Uses multi-threaded Camera class to prevent TCP buffer lag during takeoff
-  - Increased stabilization delays to 5s to let the drone settle physically
-"""
-
 from perception.line_detector import LineDetector, LineDetectorConfig, Strategy
 from perception.apriltag_detector import AprilTagDetector, TagResult
 from perception.camera import Camera
@@ -30,7 +18,7 @@ sys.path.insert(0, ".")
 # MISSION CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-Airports = [1, 2]   # ← set these to the required country codes
+Airports = [3, 0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,7 +79,7 @@ TAG_MASK_HOLD_FRAMES = 5
 BORDER_MARGIN_PX = 10
 EDGE_PENALTY_PX  = 28
 
-# ── ROI bootstrap ─────────────────────────────────────────────────────────────
+# ROI bootstrap
 # How many consecutive seconds of confident line following (confidence > this
 # threshold) must pass before we narrow perception to the ROI crop.
 ROI_ACQUIRE_TIME       = 4.0   # seconds
@@ -415,7 +403,7 @@ def run():
     current_heading  = 0.0
     prev_line_cx     = None
 
-    # ── ROI bootstrap state ───────────────────────────────────────────────
+    # ROI bootstrap state 
     # Start with full-frame line search. Once the line is held at sufficient
     # confidence for ROI_ACQUIRE_TIME seconds we narrow to the ROI crop.
     roi_active          = False
@@ -668,7 +656,7 @@ def run():
         if result.junction_detected and following:
             current_turn_bias = planner.get_junction_decision(len(result.branch_centroids))
             result = detector.detect(mask, turn_bias=current_turn_bias) # Re-run with the forced bias
-            junction_cooldown = 10 # Hold the turn bias for 10 frames to ensure it commits to the branch
+            junction_cooldown = 45 
             
         error  = result.lateral_error(current_roi_w)
 
