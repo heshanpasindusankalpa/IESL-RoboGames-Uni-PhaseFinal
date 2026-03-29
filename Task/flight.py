@@ -45,13 +45,14 @@ SLOW_SPEED      = 0.15      # was 0.08 — used in TAG_REACQUIRE creep
 CREEP_SPEED     = 0.20      # was 0.15 — manual creep key
 
 KP_YAW = -0.020
-KD_YAW = -0.008
+KD_YAW = -0.012
 
-KP_LAT = 0.0006             # was 0.0004 — more lateral authority at higher speed
-KD_LAT = 0.0001
+KP_LAT = 0.0005             # more lateral authority at higher speed
+KD_LAT = 0.0003
 
 THRESHOLD    = 155
 ROI_TOP_FRAC = 0.40
+ROI_SIDE_FRAC = 0.12
 ALTITUDE     = 1.5
 
 MAX_YAW = 0.50
@@ -460,6 +461,7 @@ def run():
     tag_mask_memory     = []
     tag_mask_hold       = 0
     arrival_heading     = 0.0
+    touchdown_time      = None
 
     # Sentinel used for the very first loop iteration before a real frame
     # arrives — keeps the velocity output section safe.
@@ -599,33 +601,6 @@ def run():
                 else:
                     send_velocity(master)
 
-            elif nav_state == NavState.PRE_LAND_ALIGN:
-                if current_tag:
-                    shape_ref = frame.shape if 'frame' in locals(
-                    ) and frame is not None else last_frm.shape
-                    vx_align, vy_align, err_x, err_y, centered = tag_align_command(
-                        current_tag, shape_ref, target_offset_x=PRE_LAND_OFFSET_X,
-                        target_offset_y=PRE_LAND_OFFSET_Y, deadzone_x=PRE_LAND_DEADZONE_X,
-                        deadzone_y=PRE_LAND_DEADZONE_Y, max_vel=PRE_LAND_MAX_VEL)
-
-                    if centered:
-                        pre_land_lock_count += 1
-                    else:
-                        pre_land_lock_count = max(0, pre_land_lock_count - 1)
-
-                    if frame_count % 10 == 0:
-                        print(
-                            f"  [PRE_LAND_ALIGN] err_x={err_x:+.1f}px err_y={err_y:+.1f}px "
-                            f"vx={vx_align:+.3f} vy={vy_align:+.3f} lock={pre_land_lock_count}/{PRE_LAND_LOCK_FRAMES}")
-
-                    tag_info_str = (f"Pre-land align ex={err_x:+.1f}px ey={err_y:+.1f}px "
-                                    f"lock={pre_land_lock_count}/{PRE_LAND_LOCK_FRAMES}")
-                    send_velocity(master, vx=vx_align,
-                                  vy=vy_align, yaw_rate=0.0)
-                else:
-                    send_velocity(master)
-                    pre_land_lock_count = max(0, pre_land_lock_count - 1)
-
             elif nav_state == NavState.TAG_REACQUIRE:
                 if time.time() - tag_reacquire_start < 2.5:
                     send_velocity(master, vx=SLOW_SPEED, yaw_rate=0.0)
@@ -658,6 +633,7 @@ def run():
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         frame_w    = frame.shape[1]
         roi_y      = int(frame.shape[0] * ROI_TOP_FRAC)
+        roi_x      = int(frame_w * ROI_SIDE_FRAC)
 
         # ── Perception: AprilTag ──────────────────────────────────────────
         if (frame_count % TAG_DETECT_INTERVAL == 0) or (nav_state in (NavState.TAG_HOVER, NavState.PRE_LAND_ALIGN)):
@@ -706,9 +682,12 @@ def run():
         # line from any position after takeoff. Once it has tracked
         # confidently for ROI_ACQUIRE_TIME seconds, narrow to the ROI crop.
         if roi_active:
-            roi = frame[roi_y:, :]
+            # Crop top (roi_y to end) AND sides (roi_x to frame_w - roi_x)
+            roi = frame[roi_y:, roi_x:frame_w-roi_x]
+            current_roi_w = frame_w - (2 * roi_x)
         else:
             roi = frame           # full frame search
+            current_roi_w = frame_w
 
         mask = keep_valid_contours(make_mask(roi, thresh[0]))
         if junction_cooldown > 0:
@@ -723,7 +702,7 @@ def run():
             result = detector.detect(mask, turn_bias=current_turn_bias) # Re-run with the forced bias
             junction_cooldown = 10 # Hold the turn bias for 10 frames to ensure it commits to the branch
             
-        error  = result.lateral_error(frame_w)
+        error  = result.lateral_error(current_roi_w)
 
         # ── ROI acquisition timer ─────────────────────────────────────────
         if not roi_active:
@@ -786,46 +765,49 @@ def run():
             if pre_land_lock_count >= PRE_LAND_LOCK_FRAMES and current_tag is not None:
                 print("[Nav] ✅ Pre-land alignment locked. → LANDING")
                 nav_state = NavState.LANDING
-                send_velocity(master)
+                send_velocity(master) # Stop horizontal movement
                 time.sleep(0.4)
                 set_mode(master, "LAND")
-
                 print("[Nav] Landing ...")
-                deadline = time.time() + 30
-                touchdown_time = None
+                touchdown_time = None # Initialize the touchdown timer
+
+        elif nav_state == NavState.LANDING:
+            # We are descending! Because this is an 'elif', the main loop keeps 
+            # running. The camera will NEVER freeze.
+            tag_info_str = f"LANDING... Alt: {alt:.2f}m"
+            
+            if touchdown_time is None:
+                # Detect ground
+                if alt < 0.2 or not is_armed(master):
+                    print("[Nav] Touchdown detected! Waiting 7 seconds on the pad...")
+                    touchdown_time = time.time()
+            else:
+                # We are on the ground, count down 7 seconds
+                time_on_pad = time.time() - touchdown_time
+                tag_info_str = f"ON PAD. Waiting: {7.0 - time_on_pad:.1f}s"
                 
-                while time.time() < deadline:
-                    # 1. Keep draining telemetry to get fresh altitude
-                    msg = master.recv_match(blocking=False)
-                    while msg:
-                        if msg.get_type() == "GLOBAL_POSITION_INT":
-                            alt = msg.relative_alt / 1000.0
-                        msg = master.recv_match(blocking=False)
+                if time_on_pad >= 7.0:
+                    if current_tag and current_tag.country_code in targets_remaining:
+                        targets_remaining.remove(current_tag.country_code)
+                    print(f"[Nav] Landed! Targets remaining: {targets_remaining}")
 
-                    # 2. Keep camera buffer empty and display alive so it doesn't freeze
-                    try:
-                        cam_frame = get_frame(cam)
-                        if cam_frame is not None:
-                            last_frm = cam_frame
-                            cv2.imshow("Full frame", cam_frame)
-                            cv2.waitKey(1)
-                    except:
-                        pass
-                    
-                    # 3. Detect touchdown (altitude near ground) or auto-disarm
-                    if (alt < 0.2 or not is_armed(master)) and touchdown_time is None:
-                        print("[Nav] Touchdown detected! Waiting 7 seconds on the pad...")
-                        touchdown_time = time.time()
-                        
-                    # 4. Break loop after 7 seconds on the ground
-                    if touchdown_time is not None and (time.time() - touchdown_time) >= 7.0:
-                        break
-                        
-                    time.sleep(0.05)
+                    if not targets_remaining:
+                        nav_state    = NavState.DONE
+                        print("[Nav] 🎉 ALL TARGETS REACHED — MISSION COMPLETE!")
+                        tag_info_str = "MISSION COMPLETE!"
+                    else:
+                        print("[Nav] Re-taking off to continue mission ...")
+                        arm_and_takeoff(master, ALTITUDE)
+                        time.sleep(2.0)
 
-                if current_tag.country_code in targets_remaining:
-                    targets_remaining.remove(current_tag.country_code)
-                print(f"[Nav] Landed! Targets remaining: {targets_remaining}")
+                        # Reset vision trackers for the new flight
+                        prev_line_cx        = None
+                        line_acquired_since = None
+                        
+                        nav_state           = NavState.POST_LAND_SEARCH
+                        following           = True
+                        aligning            = False
+                        print(f"[Nav] → POST_LAND_SEARCH (avoiding {(arrival_heading+180) % 360:.0f}°)")
         
         # ── Line Re-acquisition Logic ────────────────────────────────────
         if following and result.is_detected:
