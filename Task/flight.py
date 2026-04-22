@@ -368,7 +368,7 @@ def run():
     time.sleep(5.0)
 
     # Initialize the threaded camera so the buffer never fills up
-    cam = Camera(host="127.0.0.1", port=5599)
+    cam = Camera(host="127.0.0.1", port=8080)
     cam.start()
     last_frm = None
 

@@ -15,13 +15,13 @@ class Camera:
     TCP camera client.
 
     Usage:
-        cam = Camera(host='127.0.0.1', port=5599)
+        cam = Camera(host='127.0.0.1', port=8080)
         cam.start(callback=my_fn)   # my_fn(frame: np.ndarray) called per frame
         ...
         cam.stop()
     """
 
-    def __init__(self, host: str = '127.0.0.1', port: int = 5599):
+    def __init__(self, host: str = '127.0.0.1', port: int = 8080):
         self.host = host
         self.port = port
 
