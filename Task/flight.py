@@ -603,13 +603,13 @@ def run():
             time.sleep(0.01)
             continue
 
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         frame_w    = frame.shape[1]
         roi_y      = int(frame.shape[0] * ROI_TOP_FRAC)
         roi_x      = int(frame_w * ROI_SIDE_FRAC)
 
         # ── Perception: AprilTag ──────────────────────────────────────────
         if (frame_count % TAG_DETECT_INTERVAL == 0) or (nav_state in (NavState.TAG_HOVER, NavState.PRE_LAND_ALIGN)):
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             last_tag_detections = tag_detector.detect(gray_frame)
 
             if not last_tag_detections and tag_mask_hold > 0:
@@ -711,6 +711,7 @@ def run():
         # ── State transitions logic ───────────────────────────────────────
         if nav_state == NavState.TAG_HOVER:
             if time.time() - tag_hover_start >= TAG_HOVER_TIME:
+                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 final_tags = tag_detector.detect(gray_frame)
                 if final_tags:
                     current_tag = max(final_tags, key=tag_corner_area)
