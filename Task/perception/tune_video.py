@@ -14,10 +14,17 @@ def run_video_tuner(video_path: str):
 
     cv2.namedWindow("HSV Tuner", cv2.WINDOW_NORMAL)
     
-    # Starting values (roughly yellow)
-    for name, val in [("H low", 18), ("H high", 35),
-                      ("S low", 80), ("S high", 255),
-                      ("V low", 80), ("V high", 255)]:
+    # --- YELLOW VALUES (Commented Out) ---
+    # for name, val in [("H low", 18), ("H high", 35),
+    #                   ("S low", 80), ("S high", 255),
+    #                   ("V low", 80), ("V high", 255)]:
+    #     cv2.createTrackbar(name, "HSV Tuner", val, 255, lambda x: None)
+
+    # --- RED VALUES ---
+    # Starting with the lower half of the red spectrum and high saturation
+    for name, val in [("H low", 0), ("H high", 15),
+                      ("S low", 100), ("S high", 255),
+                      ("V low", 60), ("V high", 255)]:
         cv2.createTrackbar(name, "HSV Tuner", val, 255, lambda x: None)
 
     pre = Preprocessor(PreprocessorConfig())
@@ -67,6 +74,6 @@ def run_video_tuner(video_path: str):
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    raw_path = "~/IESL-RoboGames-Uni-Finals/samples/video/sample_1.mp4"
+    raw_path = "~/IESL-RoboGames-Uni-Finals/samples/video/line_follow.mp4"
     absolute_path = os.path.expanduser(raw_path)
     run_video_tuner(absolute_path)
