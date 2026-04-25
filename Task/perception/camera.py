@@ -64,7 +64,7 @@ class Camera:
             self._thread.join(timeout=3.0)
         self._stop_event = None
         self._thread = None
-        cv2.destroyAllWindows()
+        # cv2.destroyAllWindows()
 
     def get_frame(self) -> np.ndarray | None:
         """

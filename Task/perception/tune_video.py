@@ -3,7 +3,6 @@ import numpy as np
 import sys
 import os
 
-# Try/except block to handle both absolute and relative import paths
 try:
     from perception.preprocessor import Preprocessor, PreprocessorConfig
     from perception.apriltag_detector import AprilTagDetector
@@ -21,7 +20,6 @@ def draw_tags_on_frame(vis, tags):
         cx, cy = int(tag.center[0]), int(tag.center[1])
         cv2.circle(vis, (cx, cy), 5, (0, 0, 255), -1)
         
-        # Display the decoded Country Code and Airport Status
         label = f"ID:{tag.tag_id} C:{tag.country_code} S:{tag.airport_status}"
         cv2.putText(vis, label, (cx - 40, cy - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 2)
@@ -33,20 +31,19 @@ def run_video_tuner(video_path: str):
         print(f"Error: Could not open video {video_path}")
         return
 
-    # Create two windows: one for the Line tuner, one for the Tag detector
-    cv2.namedWindow("HSV Tuner", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("HSV Tuner (Dual Mask)", cv2.WINDOW_NORMAL)
     cv2.namedWindow("Full Frame + Tags", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Full Frame + Tags", 640, 480)
     
-    # --- RED VALUES ---
-    for name, val in [("H low", 0), ("H high", 15),
-                      ("S low", 100), ("S high", 255),
-                      ("V low", 60), ("V high", 255)]:
-        cv2.createTrackbar(name, "HSV Tuner", val, 255, lambda x: None)
+    # --- UPDATED DUAL RED MASK SLIDERS ---
+    # H1 Max controls the 0-15 side. H2 Min controls the 160-179 side.
+    for name, val in [("H1 Max (Low Red)", 15), ("H2 Min (High Red)", 160),
+                      ("S Min", 60), ("S Max", 255),
+                      ("V Min", 60), ("V Max", 255)]:
+        cv2.createTrackbar(name, "HSV Tuner (Dual Mask)", val, 255, lambda x: None)
 
     pre = Preprocessor(PreprocessorConfig())
     
-    # Initialize the exact AprilTag settings used in flight.py
     tag_detector = AprilTagDetector(
         quad_decimate=2.0,
         quad_sigma=0.2,
@@ -63,52 +60,69 @@ def run_video_tuner(video_path: str):
     while True:
         if not paused:
             ret, new_frame = cap.read()
-            
-            # Loop the video continuously if it reaches the end
             if not ret:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
-                
             raw_frame = new_frame
 
         if raw_frame is None:
             continue
 
-        # 1. Resize to match physical drone camera (CRITICAL FOR ACCURATE SIMULATION)
         frame = cv2.resize(raw_frame, (640, 480))
         display_frame = frame.copy()
 
-        # 2. AprilTag Detection Pipeline
+        # 1. Tag Detection
         gray = cv2.cvtColor(display_frame, cv2.COLOR_BGR2GRAY)
         tags = tag_detector.detect(gray)
         draw_tags_on_frame(display_frame, tags)
 
-        # 3. Line Detection Pipeline
-        h_lo = cv2.getTrackbarPos("H low",  "HSV Tuner")
-        h_hi = cv2.getTrackbarPos("H high", "HSV Tuner")
-        s_lo = cv2.getTrackbarPos("S low",  "HSV Tuner")
-        s_hi = cv2.getTrackbarPos("S high", "HSV Tuner")
-        v_lo = cv2.getTrackbarPos("V low",  "HSV Tuner")
-        v_hi = cv2.getTrackbarPos("V high", "HSV Tuner")
+        # 2. Get Tuner Values
+        h1_max = cv2.getTrackbarPos("H1 Max (Low Red)",  "HSV Tuner (Dual Mask)")
+        h2_min = cv2.getTrackbarPos("H2 Min (High Red)", "HSV Tuner (Dual Mask)")
+        s_min  = cv2.getTrackbarPos("S Min",  "HSV Tuner (Dual Mask)")
+        s_max  = cv2.getTrackbarPos("S Max",  "HSV Tuner (Dual Mask)")
+        v_min  = cv2.getTrackbarPos("V Min",  "HSV Tuner (Dual Mask)")
+        v_max  = cv2.getTrackbarPos("V Max",  "HSV Tuner (Dual Mask)")
 
-        pre.update_hsv([h_lo, s_lo, v_lo], [h_hi, s_hi, v_hi])
+        # 3. Exact Dual Mask Logic (Matches flight.py)
+        # Use preprocessor to safely crop the ROI
+        resized_for_roi = pre._resize(display_frame)
+        roi = pre._crop_roi(resized_for_roi)
         
-        # We pass the display_frame so you can see if the tags interfere with the line crop
-        mask, roi = pre.process(display_frame)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        
+        # Mask 1 (Low Reds)
+        lower_red1 = np.array([0, s_min, v_min], dtype=np.uint8)
+        upper_red1 = np.array([h1_max, s_max, v_max], dtype=np.uint8)
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        
+        # Mask 2 (High Reds)
+        lower_red2 = np.array([h2_min, s_min, v_min], dtype=np.uint8)
+        upper_red2 = np.array([179, s_max, v_max], dtype=np.uint8)
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        
+        # Combine
+        m = cv2.bitwise_or(mask1, mask2)
+        
+        # Clean (Morphology)
+        k = np.ones((3, 3), np.uint8)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  k)
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
+        k_bridge = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 21))
+        mask = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k_bridge)
 
-        # Display the color crop and the binary mask side-by-side
+        # 4. Display
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         combined_view = np.hstack([roi, mask_bgr])
         
-        # Show both windows
-        cv2.imshow("HSV Tuner", combined_view)
+        cv2.imshow("HSV Tuner (Dual Mask)", combined_view)
         cv2.imshow("Full Frame + Tags", display_frame)
 
         key = cv2.waitKey(30) & 0xFF
         if key == ord('q'):
-            print(f"\n[Tuner] Final HSV values to put in your PreprocessorConfig:")
-            print(f"  hsv_lower: [{h_lo}, {s_lo}, {v_lo}]")
-            print(f"  hsv_upper: [{h_hi}, {s_hi}, {v_hi}]")
+            print(f"\n[Tuner] Final Dual Mask HSV values to put in flight.py:")
+            print(f"  Mask 1 (Low Red) : [0, {s_min}, {v_min}] to [{h1_max}, {s_max}, {v_max}]")
+            print(f"  Mask 2 (High Red): [{h2_min}, {s_min}, {v_min}] to [179, {s_max}, {v_max}]")
             break
         elif key == ord(' '):
             paused = not paused
@@ -117,7 +131,6 @@ def run_video_tuner(video_path: str):
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    # Change Uni-PhaseFinal back to Uni-Finals
-    raw_path = "~/IESL-RoboGames-Uni-Finals/samples/video/line_follow.mp4" 
+    raw_path = "~/IESL-RoboGames-Uni-Finals/samples/video/new_sample.mp4" 
     absolute_path = os.path.expanduser(raw_path)
     run_video_tuner(absolute_path)
