@@ -221,8 +221,8 @@ def send_velocity(m, vx=0, vy=0, vz=0, yaw_rate=0):
 
 def make_mask(bgr, _thresh_unused):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    lower_yellow = np.array([20, 100, 100], dtype=np.uint8)
-    upper_yellow = np.array([40, 255, 255], dtype=np.uint8)
+    lower_yellow = np.array([0, 100, 60], dtype=np.uint8)
+    upper_yellow = np.array([15, 255, 255], dtype=np.uint8)
     m = cv2.inRange(hsv, lower_yellow, upper_yellow)
     k = np.ones((3, 3), np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  k)
