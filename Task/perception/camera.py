@@ -15,13 +15,13 @@ class Camera:
     TCP camera client.
 
     Usage:
-        cam = Camera(host='127.0.0.1', port=5599)
+        cam = Camera(host='127.0.0.1', port=9000)
         cam.start(callback=my_fn)   # my_fn(frame: np.ndarray) called per frame
         ...
         cam.stop()
     """
 
-    def __init__(self, host: str = '127.0.0.1', port: int = 5599):
+    def __init__(self, host: str = '127.0.0.1', port: int = 9000):
         self.host = host
         self.port = port
 
@@ -64,7 +64,7 @@ class Camera:
             self._thread.join(timeout=3.0)
         self._stop_event = None
         self._thread = None
-        cv2.destroyAllWindows()
+        # cv2.destroyAllWindows()
 
     def get_frame(self) -> np.ndarray | None:
         """

@@ -1,7 +1,11 @@
 from perception.line_detector import LineDetector, LineDetectorConfig, Strategy
 from perception.apriltag_detector import AprilTagDetector, TagResult
 from perception.camera import Camera
+from perception.tcp_camera import ThreadedTCPCamera
+# from picamera2 import Picamera2
+from perception.streamer import MJPEGStreamer
 from navigation.mission_planner import MissionPlanner
+import threading
 import math
 import sys
 import time
@@ -18,7 +22,10 @@ sys.path.insert(0, ".")
 # MISSION CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-Airports = [1, 2]
+HEADLESS = True
+LIVE_STREAM_EN = False  # True = Broadcasts MJPEG stream on port 5000
+# Airports = [1, 2]
+Airports = [2, 0]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TUNING
@@ -37,7 +44,7 @@ KD_LAT = 0.0003
 THRESHOLD    = 155
 ROI_TOP_FRAC = 0.40
 ROI_SIDE_FRAC = 0.12
-ALTITUDE     = 1.2   # lowered for better view of ground-level AprilTags
+ALTITUDE     = 0.9  # lowered for better view of ground-level AprilTags
 
 MAX_YAW = 0.50
 MAX_LAT = 0.20
@@ -105,7 +112,7 @@ class NavState(Enum):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def connect(port=14550):
-    m = mavutil.mavlink_connection(f"udp:0.0.0.0:{port}")
+    m = mavutil.mavlink_connection(f"udp:127.0.0.1:{port}")
     print("[MAVLink] Waiting for heartbeat ...")
     m.wait_heartbeat()
     print(f"[MAVLink] Connected — system {m.target_system}")
@@ -126,11 +133,29 @@ def is_armed(m):
 
 def arm_and_takeoff(m, alt):
     set_mode(m, "GUIDED")
+    
+    print("[MAVLink] Configuring smooth takeoff speeds...")
+    # 1. Cap maximum ascent speed to 50 cm/s (0.5 m/s)
+    m.mav.param_set_send(
+        m.target_system, m.target_component,
+        b'WPNAV_SPEED_UP', 50.0, 
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+    time.sleep(0.2)
+    
+    # 2. Lower vertical acceleration to 50 cm/s/s for a gentle spool-up
+    m.mav.param_set_send(
+        m.target_system, m.target_component,
+        b'WPNAV_ACCEL_Z', 50.0, 
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+    time.sleep(0.5)
+
     print("[MAVLink] Arming ...")
+    
+    # 🚨 CHANGED: Replaced 21196 with 0 to enable pre-arm safety checks
     m.mav.command_long_send(
         m.target_system, m.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0, 1, 21196, 0, 0, 0, 0, 0)
+        0, 1, 0, 0, 0, 0, 0, 0)
 
     deadline = time.time() + 15
     while time.time() < deadline:
@@ -145,7 +170,7 @@ def arm_and_takeoff(m, alt):
         m.target_system, m.target_component,
         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
         0, 0, 0, 0, 0, 0, 0, alt)
-    print(f"[MAVLink] Taking off to {alt} m ...")
+    print(f"[MAVLink] Taking off smoothly to {alt} m ...")
 
     last_log = 0
     deadline = time.time() + 35
@@ -178,14 +203,28 @@ def send_velocity(m, vx=0, vy=0, vz=0, yaw_rate=0):
 
 def make_mask(bgr, _thresh_unused):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    lower_yellow = np.array([20, 100, 100], dtype=np.uint8)
-    upper_yellow = np.array([40, 255, 255], dtype=np.uint8)
-    m = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    
+    # 1. Lower Red Mask (Catches the bright/orange-reds that were causing spots)
+    # Lowered Saturation to 60 to help with glare
+    lower_red1 = np.array([0, 60, 60], dtype=np.uint8)
+    upper_red1 = np.array([15, 255, 255], dtype=np.uint8)
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    
+    # 2. Upper Red Mask (Catches the deep/dark reds)
+    lower_red2 = np.array([160, 60, 60], dtype=np.uint8)
+    upper_red2 = np.array([179, 255, 255], dtype=np.uint8)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    
+    # 3. Combine them to get a completely solid line!
+    m = cv2.bitwise_or(mask1, mask2)
+    
+    # Existing morphology cleanups
     k = np.ones((3, 3), np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  k)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
     k_bridge = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 21))
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k_bridge)
+    
     return m
 
 def keep_valid_contours(mask, min_area=120, min_thickness=12):
@@ -349,6 +388,40 @@ def draw_tags_on_frame(vis, tags):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
 
+class DirectCamera:
+    def __init__(self, width=640, height=480):
+        self._picam = Picamera2()
+        config = self._picam.create_video_configuration(
+            {"format": "BGR888", "size": (width, height)}
+        )
+        self._picam.configure(config)
+        self._latest_frame = None
+        self._lock = threading.Lock()
+        self._running = False
+
+    def start(self):
+        self._picam.start()
+        self._running = True
+        threading.Thread(target=self._update, daemon=True).start()
+        # Wait for first frame
+        while self._latest_frame is None:
+            time.sleep(0.01)
+        print("[Camera] Direct hardware capture started.")
+
+    def _update(self):
+        while self._running:
+            frame = self._picam.capture_array()
+            with self._lock:
+                self._latest_frame = frame
+
+    def get_frame(self):
+        with self._lock:
+            return self._latest_frame.copy() if self._latest_frame is not None else None
+
+    def stop(self):
+        self._running = False
+        self._picam.stop()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -367,9 +440,13 @@ def run():
     print("[Test] Stabilizing 5 s ...")
     time.sleep(5.0)
 
-    # Initialize the threaded camera so the buffer never fills up
-    cam = Camera(host="127.0.0.1", port=5599)
+    # cam = Camera(host="127.0.0.1", port=9000)
+    cam = ThreadedTCPCamera(ip="127.0.0.1", port=9000)
+    # cam = DirectCamera(width=640, height=480)
     cam.start()
+
+    if LIVE_STREAM_EN:
+        live_stream = MJPEGStreamer(port=5000)
     last_frm = None
 
     detector = LineDetector(LineDetectorConfig(
@@ -385,15 +462,16 @@ def run():
     current_turn_bias = "straight"
     junction_cooldown = 0
 
-    cv2.namedWindow("Annotated ROI", cv2.WINDOW_NORMAL)
-    cv2.namedWindow("Binary mask",   cv2.WINDOW_NORMAL)
-    cv2.namedWindow("Full frame",    cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Annotated ROI", 520, 340)
-    cv2.resizeWindow("Binary mask",   520, 340)
-    cv2.resizeWindow("Full frame",    520, 340)
-    cv2.moveWindow("Annotated ROI",   0,   40)
-    cv2.moveWindow("Binary mask",   540,   40)
-    cv2.moveWindow("Full frame",      0,  420)
+    if not HEADLESS:
+        cv2.namedWindow("Annotated ROI", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Binary mask",   cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Full frame",    cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Annotated ROI", 520, 340)
+        cv2.resizeWindow("Binary mask",   520, 340)
+        cv2.resizeWindow("Full frame",    520, 340)
+        cv2.moveWindow("Annotated ROI",   0,   40)
+        cv2.moveWindow("Binary mask",   540,   40)
+        cv2.moveWindow("Full frame",      0,  420)
 
     # ── State ─────────────────────────────────────────────────────────────
     # Auto-start: drone begins searching for line immediately after takeoff.
@@ -587,8 +665,8 @@ def run():
 
         # ── Read frame (using non-blocking Threaded Camera) ───────────────
         fetched_frame = cam.get_frame()
-        if fetched_frame is not None:
-            frame = fetched_frame
+        if fetched_frame is not None and fetched_frame.size > 0:
+            frame = cv2.resize(fetched_frame, (640, 480))
             last_frm = frame
         else:
             frame = last_frm
@@ -597,13 +675,13 @@ def run():
             time.sleep(0.01)
             continue
 
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         frame_w    = frame.shape[1]
         roi_y      = int(frame.shape[0] * ROI_TOP_FRAC)
         roi_x      = int(frame_w * ROI_SIDE_FRAC)
 
         # ── Perception: AprilTag ──────────────────────────────────────────
         if (frame_count % TAG_DETECT_INTERVAL == 0) or (nav_state in (NavState.TAG_HOVER, NavState.PRE_LAND_ALIGN)):
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             last_tag_detections = tag_detector.detect(gray_frame)
 
             if not last_tag_detections and tag_mask_hold > 0:
@@ -705,6 +783,7 @@ def run():
         # ── State transitions logic ───────────────────────────────────────
         if nav_state == NavState.TAG_HOVER:
             if time.time() - tag_hover_start >= TAG_HOVER_TIME:
+                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 final_tags = tag_detector.detect(gray_frame)
                 if final_tags:
                     current_tag = max(final_tags, key=tag_corner_area)
@@ -743,23 +822,33 @@ def run():
 
         if nav_state == NavState.PRE_LAND_ALIGN:
             if pre_land_lock_count >= PRE_LAND_LOCK_FRAMES and current_tag is not None:
-                print("[Nav] ✅ Pre-land alignment locked. → LANDING")
+                print("[Nav] ✅ Pre-land alignment locked. Preparing for touchdown...")
+                
+                # 1. Scrub Momentum
+                send_velocity(master) # Send 0 m/s
+                time.sleep(2.0)       # Let airframe settle
+                
+                # 2. Cap Descent Speeds safely
+                print("[Nav] Configuring descent speeds...")
+                master.mav.param_set_send(master.target_system, master.target_component, b'WPNAV_SPEED_DN', 30.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+                time.sleep(0.2)
+                master.mav.param_set_send(master.target_system, master.target_component, b'LAND_SPEED', 15.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+                time.sleep(0.5)
+
+                # 3. Trigger Native Land
                 nav_state = NavState.LANDING
-                send_velocity(master) # Stop horizontal movement
-                time.sleep(0.4)
                 set_mode(master, "LAND")
-                print("[Nav] Landing ...")
-                touchdown_time = None # Initialize the touchdown timer
+                print("[Nav] Native LAND mode triggered. Descending...")
+                touchdown_time = None
 
         elif nav_state == NavState.LANDING:
-            # We are descending! Because this is an 'elif', the main loop keeps 
-            # running. The camera will NEVER freeze.
             tag_info_str = f"LANDING... Alt: {alt:.2f}m"
             
             if touchdown_time is None:
-                # Detect ground
-                if alt < 0.2 or not is_armed(master):
-                    print("[Nav] Touchdown detected! Waiting 7 seconds on the pad...")
+                # 🚨 SAFEST TOUCHDOWN DETECTION: Wait for ArduPilot to auto-disarm!
+                # We no longer check (alt < 0.2) because ground-effect barometer drift causes false positives.
+                if not is_armed(master):
+                    print("[Nav] Auto-disarm confirmed! Touchdown successful. Waiting 7 seconds on the pad...")
                     touchdown_time = time.time()
             else:
                 # We are on the ground, count down 7 seconds
@@ -769,18 +858,16 @@ def run():
                 if time_on_pad >= 7.0:
                     if current_tag and current_tag.country_code in targets_remaining:
                         targets_remaining.remove(current_tag.country_code)
-                    print(f"[Nav] Landed! Targets remaining: {targets_remaining}")
+                    print(f"[Nav] Pad wait complete! Targets remaining: {targets_remaining}")
 
                     if not targets_remaining:
                         nav_state    = NavState.DONE
                         print("[Nav] 🎉 ALL TARGETS REACHED — MISSION COMPLETE!")
                         tag_info_str = "MISSION COMPLETE!"
                     else:
-                        print("[Nav] Re-taking off to continue mission ...")
+                        print("[Nav] Re-arming and taking off to continue mission ...")
                         arm_and_takeoff(master, ALTITUDE)
                         
-                        # Fix applied here: Wait 5 seconds dynamically while camera 
-                        # safely continues draining the queue in the background
                         print("[Nav] Stabilizing 5 s ...")
                         time.sleep(5.0)
 
@@ -792,6 +879,57 @@ def run():
                         following           = True
                         aligning            = False
                         print(f"[Nav] → POST_LAND_SEARCH (avoiding {(arrival_heading+180) % 360:.0f}°)")
+        # if nav_state == NavState.PRE_LAND_ALIGN:
+        #     if pre_land_lock_count >= PRE_LAND_LOCK_FRAMES and current_tag is not None:
+        #         print("[Nav] ✅ Pre-land alignment locked. → LANDING")
+        #         nav_state = NavState.LANDING
+        #         send_velocity(master) # Stop horizontal movement
+        #         time.sleep(0.4)
+        #         set_mode(master, "LAND")
+        #         print("[Nav] Landing ...")
+        #         touchdown_time = None # Initialize the touchdown timer
+
+        # elif nav_state == NavState.LANDING:
+        #     # We are descending! Because this is an 'elif', the main loop keeps 
+        #     # running. The camera will NEVER freeze.
+        #     tag_info_str = f"LANDING... Alt: {alt:.2f}m"
+            
+        #     if touchdown_time is None:
+        #         # Detect ground
+        #         if alt < 0.2 or not is_armed(master):
+        #             print("[Nav] Touchdown detected! Waiting 7 seconds on the pad...")
+        #             touchdown_time = time.time()
+        #     else:
+        #         # We are on the ground, count down 7 seconds
+        #         time_on_pad = time.time() - touchdown_time
+        #         tag_info_str = f"ON PAD. Waiting: {7.0 - time_on_pad:.1f}s"
+                
+        #         if time_on_pad >= 7.0:
+        #             if current_tag and current_tag.country_code in targets_remaining:
+        #                 targets_remaining.remove(current_tag.country_code)
+        #             print(f"[Nav] Landed! Targets remaining: {targets_remaining}")
+
+        #             if not targets_remaining:
+        #                 nav_state    = NavState.DONE
+        #                 print("[Nav] 🎉 ALL TARGETS REACHED — MISSION COMPLETE!")
+        #                 tag_info_str = "MISSION COMPLETE!"
+        #             else:
+        #                 print("[Nav] Re-taking off to continue mission ...")
+        #                 arm_and_takeoff(master, ALTITUDE)
+                        
+        #                 # Fix applied here: Wait 5 seconds dynamically while camera 
+        #                 # safely continues draining the queue in the background
+        #                 print("[Nav] Stabilizing 5 s ...")
+        #                 time.sleep(5.0)
+
+        #                 # Reset vision trackers for the new flight
+        #                 prev_line_cx        = None
+        #                 line_acquired_since = None
+                        
+        #                 nav_state           = NavState.POST_LAND_SEARCH
+        #                 following           = True
+        #                 aligning            = False
+        #                 print(f"[Nav] → POST_LAND_SEARCH (avoiding {(arrival_heading+180) % 360:.0f}°)")
         
         # ── Line Re-acquisition Logic ────────────────────────────────────
         if following and result.is_detected:
@@ -833,56 +971,62 @@ def run():
                       f"err={error:+5.1f}px  ang={result.angle_deg:+5.1f}°  vy={vy_cmd:+.3f}  yr={yr_cmd:+.3f}  "
                       f"{'[FULL]' if not roi_active else '[ROI]'}")
 
-        ann = draw_ann(roi, mask, result, frame_w, error, vy_cmd, yr_cmd, nav_state,
-                       following, aligning, creep, thresh[0], alt, fps,
-                       tag_info_str, len(targets_remaining), roi_active)
-        msk      = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        full_vis = frame.copy()
-        if last_tag_detections:
-            draw_tags_on_frame(full_vis, last_tag_detections)
+        if LIVE_STREAM_EN or not HEADLESS:
+            ann = draw_ann(roi, mask, result, frame_w, error, vy_cmd, yr_cmd, nav_state,
+                        following, aligning, creep, thresh[0], alt, fps,
+                        tag_info_str, len(targets_remaining), roi_active)
+            if LIVE_STREAM_EN:
+                live_stream.update_frame(ann)
 
-        cv2.imshow("Annotated ROI", ann)
-        cv2.imshow("Binary mask",   msk)
-        cv2.imshow("Full frame",    full_vis)
+        if not HEADLESS:
+            msk      = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            full_vis = frame.copy()
+            if last_tag_detections:
+                draw_tags_on_frame(full_vis, last_tag_detections)
 
-        # ── Keys ──────────────────────────────────────────────────────────
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            send_velocity(master)
-            time.sleep(0.3)
-            set_mode(master, "LAND")
-            print("[Test] Landing ...")
-            break
-        elif key == ord("f"):
-            following = not following
-            if following:
-                creep        = False
-                aligning     = True
-                prev_yr      = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
-                t_ctrl       = time.time()
-                nav_state    = NavState.LINE_FOLLOW
-                print("\n[Follow] ON — aligning to line first ...")
-            else:
+            cv2.imshow("Annotated ROI", ann)
+            cv2.imshow("Binary mask",   msk)
+            cv2.imshow("Full frame",    full_vis)
+
+            # ── Keys ──────────────────────────────────────────────────────────
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 send_velocity(master)
-                aligning = False
-                print("[Follow] OFF")
-        elif key == ord("c") and not following:
-            creep = not creep
-            if not creep:
+                time.sleep(0.3)
+                set_mode(master, "LAND")
+                print("[Test] Landing ...")
+                break
+            elif key == ord("f"):
+                following = not following
+                if following:
+                    creep        = False
+                    aligning     = True
+                    prev_yr      = prev_angle = prev_error = smooth_angle = smooth_error = 0.0
+                    t_ctrl       = time.time()
+                    nav_state    = NavState.LINE_FOLLOW
+                    print("\n[Follow] ON — aligning to line first ...")
+                else:
+                    send_velocity(master)
+                    aligning = False
+                    print("[Follow] OFF")
+            elif key == ord("c") and not following:
+                creep = not creep
+                if not creep:
+                    send_velocity(master)
+                print(f"[Creep] {'ON' if creep else 'OFF'}")
+            elif key == ord("t") and not tuner_on:
+                cv2.createTrackbar("Threshold", "Binary mask",
+                                thresh[0], 255, lambda v: thresh.__setitem__(0, v))
+                tuner_on = True
+            elif key == ord("0"):
+                following = creep = False
+                nav_state = NavState.LINE_FOLLOW
                 send_velocity(master)
-            print(f"[Creep] {'ON' if creep else 'OFF'}")
-        elif key == ord("t") and not tuner_on:
-            cv2.createTrackbar("Threshold", "Binary mask",
-                               thresh[0], 255, lambda v: thresh.__setitem__(0, v))
-            tuner_on = True
-        elif key == ord("0"):
-            following = creep = False
-            nav_state = NavState.LINE_FOLLOW
-            send_velocity(master)
-            print("[Manual] Stopped")
+                print("[Manual] Stopped")
 
     cam.stop()
-    cv2.destroyAllWindows()
+    if not HEADLESS:
+        cv2.destroyAllWindows()
     print("[Test] Done.")
 
 
