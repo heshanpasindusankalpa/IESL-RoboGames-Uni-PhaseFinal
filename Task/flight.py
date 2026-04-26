@@ -25,7 +25,7 @@ sys.path.insert(0, ".")
 HEADLESS = True
 LIVE_STREAM_EN = False  # True = Broadcasts MJPEG stream on port 5000
 # Airports = [1, 2]
-Airports = [3, 0]
+Airports = [2, 0]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TUNING
